@@ -1,0 +1,10 @@
+source:
+  type: "delta-lake"
+  config:
+    base_path: "testfolder"
+
+sink:
+  type: "datahub-rest"
+  config:
+    server: "https://data-api-test.sysops.xyz"
+    token: "eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImFsZWtzYW5kci5wbGF0b25vdiIsInR5cGUiOiJQRVJTT05BTCIsInZlcnNpb24iOiIyIiwianRpIjoiNGQ3YmYzYjAtY2I4Yy00ZjliLTk5YmQtZjdjMzRhZmU0MjFiIiwic3ViIjoiYWxla3NhbmRyLnBsYXRvbm92IiwiZXhwIjoxNzUyOTE4NTY1LCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.2j_FAiD30u2rQlvPDbbHd_g38i962smmdxk86imqpwQ"
