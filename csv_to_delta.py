@@ -13,6 +13,7 @@ import argparse
 from pathlib import Path
 
 import delta
+from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType
 from pyspark.sql.functions import asc
@@ -46,6 +47,7 @@ def get_spark() -> SparkSession:
     Returns:
         SparkSession: Configured Spark session
     """
+    # Initialize with Delta Lake support
     builder = (SparkSession.builder
         .master("local[*]")
         .appName("DeltaLakeProcessor")
@@ -59,7 +61,15 @@ def get_spark() -> SparkSession:
         .config("spark.datahub.rest.server", "https://data-api-test.sysops.xyz")
         .config("spark.datahub.rest.token", "eyJhbGciOiJIUzI1NiJ9.eyJhY3RvclR5cGUiOiJVU0VSIiwiYWN0b3JJZCI6ImFsZWtzYW5kci5wbGF0b25vdiIsInR5cGUiOiJQRVJTT05BTCIsInZlcnNpb24iOiIyIiwianRpIjoiNGQ3YmYzYjAtY2I4Yy00ZjliLTk5YmQtZjdjMzRhZmU0MjFiIiwic3ViIjoiYWxla3NhbmRyLnBsYXRvbm92IiwiZXhwIjoxNzUyOTE4NTY1LCJpc3MiOiJkYXRhaHViLW1ldGFkYXRhLXNlcnZpY2UifQ.2j_FAiD30u2rQlvPDbbHd_g38i962smmdxk86imqpwQ")
     )
-    # Initialize with Delta Lake support
+    # Initialize without lineage support
+    # builder = (SparkSession.builder
+    #            .master("local[*]")
+    #            .appName("DeltaLakeProcessor")
+    #            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+    #            .config("spark.sql.catalog.spark_catalog",
+    #                 "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+    #            )
+
     spark = delta.configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("INFO")
     return spark
@@ -208,6 +218,114 @@ def merge_employees_data(spark: SparkSession) -> bool:
         print(f"Error performing merge: {e}")
         return False
 
+def delta_merge_employees_data(spark: SparkSession) -> bool:
+    """Merge employee summary data using Delta Table API (dt.merge) without spark.sql.
+
+    This function demonstrates a Delta Lake MERGE operation using pure Delta Table API
+    with column transformations, creating a new target table for lineage testing.
+
+    Args:
+        spark: Active Spark session
+
+    Returns:
+        bool: Success status of the operation
+    """
+    try:
+        print("Performing Delta Table API merge operation...")
+
+        # Define paths
+        employees_summary_path = BASE_FOLDER / "employees_summary"
+        employees_delta_merged_path = BASE_FOLDER / "employees_delta_merged"
+
+        # Check if source table exists
+        if not employees_summary_path.exists():
+            print(f"Error: Source table '{employees_summary_path}' not found.")
+            print("Please run the following commands first:")
+            print("  python csv_to_delta.py create")
+            print("  python csv_to_delta.py view")
+            print("Then retry: python csv_to_delta.py deltamerge")
+            return False
+
+        # Read source data as DataFrame
+        source_df = spark.read.format("delta").load(str(employees_summary_path))
+
+        # Create target table if it doesn't exist - using DataFrame operations only
+        if not Path(employees_delta_merged_path).exists():
+            print(f"Creating target table at: {employees_delta_merged_path}")
+            # Create empty target table with same schema
+            empty_df = source_df.limit(0)
+            (empty_df.write
+                .format("delta")
+                .mode("overwrite")
+                .save(str(employees_delta_merged_path)))
+
+        # Get DeltaTable instance for target
+        dt = DeltaTable.forPath(spark, str(employees_delta_merged_path))
+
+        # Perform merge using Delta Table API - pure API approach without spark.sql
+        (
+            dt.alias("target")
+            .merge(
+                source=source_df.alias("source"), 
+                condition="target.gender = source.gender"
+            )
+            .whenMatchedUpdate(set={
+                "employee_count": "source.max_salary",
+                "avg_salary": "source.min_salary", 
+                "min_salary": "source.avg_salary",
+                "max_salary": "source.employee_count"
+            })
+            .whenNotMatchedInsert(values={
+                "gender": "source.gender",
+                "employee_count": "source.max_salary",
+                "avg_salary": "source.min_salary",
+                "min_salary": "source.avg_salary", 
+                "max_salary": "source.employee_count"
+            })
+            .execute()
+        )
+
+        # Show the contents of the merged table
+        print("\nDelta API merged table contents:")
+        result_df = spark.read.format("delta").load(str(employees_delta_merged_path))
+        result_df.show(truncate=False)
+
+        # Create additional downstream table using DataFrame operations (no SQL)
+        employees_final_path = BASE_FOLDER / "employees_final_summary"
+        print(f"\nCreating final summary table at: {employees_final_path}")
+
+        # Use DataFrame API for transformations instead of SQL
+        from pyspark.sql.functions import col, lit, when
+
+        final_summary_df = (result_df
+            .select(
+                lit("FINAL_SUMMARY").alias("report_type"),
+                col("gender"),
+                (col("employee_count") * 2).alias("doubled_count"),
+                (col("avg_salary") + 1000).alias("adjusted_avg_salary"),
+                when(col("gender") == "Male", "M")
+                .when(col("gender") == "Female", "F")
+                .otherwise("O").alias("gender_code")
+            )
+            .filter(col("employee_count") > 0)
+        )
+
+        (final_summary_df.write
+            .format("delta")
+            .mode("overwrite")
+            .save(str(employees_final_path)))
+
+        final_summary_df.show(truncate=False)
+
+        print(f"Delta Table API merge operation completed successfully!")
+        print(f"Target table: {employees_delta_merged_path}")
+        print(f"Final summary: {employees_final_path}")
+        return True
+
+    except Exception as e:
+        print(f"Error performing Delta Table API merge: {e}")
+        return False
+
 def query_data(spark: SparkSession) -> bool:
     """Query the original delta table data grouped by birthDate.
 
@@ -248,7 +366,8 @@ def parse_arguments() -> argparse.Namespace:
           python csv_to_delta.py create             # Create Delta table from default CSV
           python csv_to_delta.py create --csv=data.csv  # Create using specific CSV file
           python csv_to_delta.py view              # Create summary view by gender
-          python csv_to_delta.py merge             # Perform merge operation with transformations
+          python csv_to_delta.py merge             # Perform merge operation with transformations (using spark.sql)
+          python csv_to_delta.py deltamerge        # Perform merge operation using Delta Table API (dt.merge)
           python csv_to_delta.py query             # Query data grouped by birthDate
         '''
     )
@@ -256,9 +375,9 @@ def parse_arguments() -> argparse.Namespace:
     # Add commands as arguments
     parser.add_argument(
         'command',
-        choices=['create', 'view', 'merge', 'query'],
+        choices=['create', 'view', 'merge', 'deltamerge', 'query'],
         help=('Command to execute: create (delta table), view (create summary view), '
-              'merge (data), query (existing data)')
+              'merge (data using spark.sql), deltamerge (data using Delta Table API), query (existing data)')
     )
 
     # Optional arguments
@@ -301,6 +420,9 @@ def main() -> None:
 
         elif args.command == 'merge':
             success = merge_employees_data(spark)
+
+        elif args.command == 'deltamerge':
+            success = delta_merge_employees_data(spark)
 
         elif args.command == 'query':
             success = query_data(spark)
